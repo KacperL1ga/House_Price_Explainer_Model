@@ -1,130 +1,114 @@
-from __future__ import annotations
-
-import io
-
 import pandas as pd
 import streamlit as st
 
-from src.data import load_project_dataset, make_demo_data, prepare_data
-from src.explain import explain_record, stability_experiment, top_contributions
-from src.modeling import evaluate_model, fit_model
+from src.data import FEATURES, load_data
+from src.explain import explain_prediction
+from src.modeling import train_model
 
 
-st.set_page_config(page_title="House Price Explainer", page_icon="🏠", layout="wide")
-
-st.title("House Price Explainer")
-st.caption("Estimate a house sale price, inspect its SHAP explanation, and test explanation stability.")
-
-
-@st.cache_data(show_spinner=False)
-def load_demo() -> pd.DataFrame:
-    return make_demo_data()
-
-
-@st.cache_data(show_spinner="Preparing the data and training the model…")
-def train(csv_bytes: bytes | None, seed: int):
-    project_data = load_project_dataset()
-    raw = pd.read_csv(io.BytesIO(csv_bytes)) if csv_bytes else (project_data if project_data is not None else load_demo())
-    dataset = prepare_data(raw)
-    model, x_train, x_test, y_train, y_test, preprocessor = fit_model(dataset, seed)
-    metrics = evaluate_model(model, x_test, y_test)
-    return dataset, model, x_test, y_test, preprocessor, metrics
+LABELS = {
+    "area": "Floor area", "bedrooms": "Bedrooms", "bathrooms": "Bathrooms",
+    "floors": "Floors", "age": "Property age", "distance": "Distance to city centre",
+    "garage": "Garage", "parking": "Parking space", "garden": "Garden",
+    "security": "Security service", "school_nearby": "School nearby",
+    "hospital_nearby": "Hospital nearby", "shopping_mall_nearby": "Shopping mall nearby",
+    "public_transport": "Public transport nearby", "crime_rate": "Crime rate",
+    "population_density": "Population density", "location": "Location quality",
+    "income_level": "Area income level",
+}
 
 
-with st.sidebar:
-    st.header("Data and model")
-    uploaded = st.file_uploader("Upload Kaggle train.csv (optional)", type=["csv"])
-    st.caption("Using data/house_price_50k.csv. You can also upload a temporary CSV with a `price` or `SalePrice` target.")
-    seed = st.number_input("Random seed", min_value=0, max_value=9999, value=42, step=1)
-    st.divider()
-    st.markdown("**Model:** Random Forest Regressor  \n**Validation:** 20% holdout split")
+st.set_page_config(page_title="House Price Estimator", page_icon="🏠", layout="wide")
+st.title("🏠 House Price Estimator")
+st.write("Enter the property details to receive an estimated sale price and a SHAP explanation.")
 
-csv_bytes = uploaded.getvalue() if uploaded else None
-try:
-    dataset, model, x_test, y_test, preprocessor, metrics = train(csv_bytes, int(seed))
-except Exception as exc:
-    st.error(f"Could not prepare the dataset: {exc}")
-    st.info("Expected a CSV containing a numeric `price` or `SalePrice` column.")
-    st.stop()
 
-if uploaded is None and load_project_dataset() is None:
-    st.warning("Demo mode: results use generated sample data and are not meaningful real estate valuations.")
-elif uploaded is None:
-    st.success("Using the project dataset found in the data folder.")
+@st.cache_resource(show_spinner="Training XGBoost on 50,000 property records...")
+def load_model():
+    return train_model(load_data(), seed=42)
 
-with st.container(border=True):
-    st.subheader("Model performance on the holdout set")
-    a, b, c = st.columns(3)
-    a.metric("Mean Absolute Error", f"${metrics['mae']:,.0f}")
-    b.metric("Root Mean Squared Error", f"${metrics['rmse']:,.0f}")
-    c.metric("Holdout records", f"{len(x_test):,}")
 
-left, right = st.columns([0.95, 1.2], gap="large")
-with left:
-    st.subheader("Choose a property")
-    row_id = st.selectbox("Holdout property", options=list(x_test.index), format_func=lambda i: f"Property {i}")
-    record = x_test.loc[[row_id]].copy()
-    prediction = float(model.predict(record)[0])
-    st.metric("Predicted sale price", f"${prediction:,.0f}")
-    if "SalePrice" in dataset.raw.columns:
-        actual = float(y_test.loc[row_id])
-        st.caption(f"Actual sale price in the holdout data: ${actual:,.0f}")
-    with st.expander("Property features"):
-        st.dataframe(record.T.rename(columns={row_id: "Value"}), use_container_width=True)
-
-with right:
-    st.subheader("Why did the model make this prediction?")
-    try:
-        grouped, base_value = explain_record(model, preprocessor, record, dataset.feature_columns)
-        st.caption(f"Baseline prediction: ${base_value:,.0f}. Bars show the feature contribution to this prediction.")
-        positive, negative = top_contributions(grouped, record)
-        up, down = st.columns(2)
-        with up:
-            st.markdown("#### Features raising the estimate")
-            if positive.empty:
-                st.caption("No positive contribution for this record.")
-            for feature, row in positive.iterrows():
-                st.metric(feature, str(row["Property value"]), delta=f"+${row['SHAP contribution ($)']:,.0f}")
-        with down:
-            st.markdown("#### Features lowering the estimate")
-            if negative.empty:
-                st.caption("No negative contribution for this record.")
-            for feature, row in negative.iterrows():
-                st.metric(feature, str(row["Property value"]), delta=f"${row['SHAP contribution ($)']:,.0f}", delta_color="inverse")
-        st.markdown("#### Full contribution ranking")
-        st.bar_chart(grouped.rename("SHAP contribution ($)"), horizontal=True, color="#3867D6")
-        st.dataframe(grouped.rename("Contribution ($)").to_frame(), use_container_width=True)
-        st.caption("Positive values raise the prediction relative to the model baseline; negative values lower it.")
-    except ImportError:
-        st.error("SHAP is not installed. Install dependencies from requirements.txt.")
-    except Exception as exc:
-        st.error(f"Could not calculate the SHAP explanation: {exc}")
+model, _, _, metrics = load_model()
+with st.expander("Model performance"):
+    metric_1, metric_2, metric_3 = st.columns(3)
+    metric_1.metric("Mean Absolute Error", f"${metrics['mae']:,.0f}")
+    metric_2.metric("Root Mean Squared Error", f"${metrics['rmse']:,.0f}")
+    metric_3.metric("R² score", f"{metrics['r2']:.3f}")
 
 st.divider()
-st.subheader("Stability experiment")
-st.write("Perturb one numeric feature by a small percentage and compare the prediction and SHAP contributions.")
-numeric_features = [c for c in dataset.feature_columns if pd.api.types.is_numeric_dtype(dataset.X[c])]
-if not numeric_features:
-    st.info("No numeric features are available for the stability experiment.")
-else:
-    feature = st.selectbox("Feature to perturb", numeric_features, index=0)
-    change_pct = st.slider("Change from the selected property's value", min_value=-10, max_value=10, value=5, step=1, format="%d%%")
-    try:
-        result = stability_experiment(model, preprocessor, record, feature, change_pct, dataset.feature_columns)
-        x1, x2 = st.columns(2)
-        x1.metric("Original prediction", f"${result['original_prediction']:,.0f}")
-        x2.metric("Perturbed prediction", f"${result['perturbed_prediction']:,.0f}", delta=f"${result['prediction_delta']:,.0f}")
-        st.dataframe(result["comparison"], use_container_width=True)
-        st.caption("SHAP values describe this fitted model; this small perturbation experiment does not establish causal effects or guarantee price accuracy.")
-    except Exception as exc:
-        st.error(f"Could not run the stability experiment: {exc}")
+st.subheader("Property details")
+st.caption("Change any value by a small step and submit the form again to check how the prediction responds.")
 
-with st.expander("Methodology and limitations"):
+with st.form("house_form"):
+    col_1, col_2, col_3 = st.columns(3)
+
+    with col_1:
+        st.markdown("#### Building")
+        area = st.number_input("Floor area (m²)", min_value=300, max_value=5000, value=1500, step=50, help="Total usable floor area of the property in square metres.")
+        bedrooms = st.number_input("Bedrooms (count)", min_value=1, max_value=10, value=3, step=1, help="Number of bedrooms in the property.")
+        bathrooms = st.number_input("Bathrooms (count)", min_value=1, max_value=6, value=2, step=1, help="Number of bathrooms in the property.")
+        floors = st.number_input("Floors (count)", min_value=1, max_value=4, value=2, step=1, help="Number of floors in the property.")
+        age = st.number_input("Property age (years)", min_value=0, max_value=120, value=20, step=1, help="Age of the property in years.")
+        distance = st.number_input("Distance to city centre (km)", min_value=0, max_value=50, value=10, step=1, help="Distance from the property to the city centre in kilometres.")
+
+    with col_2:
+        st.markdown("#### Amenities")
+        garage = st.selectbox("Garage", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether the property includes a garage.")
+        parking = st.selectbox("Parking space", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether the property includes a dedicated parking space.")
+        garden = st.selectbox("Garden", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether the property includes a private garden.")
+        security = st.selectbox("Security service", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether the property or its estate has a security service.")
+        school_nearby = st.selectbox("School nearby", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether a school is located near the property.")
+        hospital_nearby = st.selectbox("Hospital nearby", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether a hospital is located near the property.")
+        shopping_mall_nearby = st.selectbox("Shopping mall nearby", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether a shopping mall is located near the property.")
+        public_transport = st.selectbox("Public transport nearby", options=[0, 1], format_func=lambda value: "Yes" if value else "No", help="Whether public transport is easily accessible from the property.")
+
+    with col_3:
+        st.markdown("#### Neighbourhood")
+        crime_rate = st.number_input("Crime rate (0–10)", min_value=0.0, max_value=10.0, value=5.0, step=0.1, help="Area crime-rate score used in the dataset; 0 is lowest and 10 is highest.")
+        population_density = st.number_input("Population density (people/km²)", min_value=500, max_value=15000, value=5000, step=100, help="Population density of the surrounding area in people per square kilometre.")
+        location = st.selectbox("Location quality", options=["low", "medium", "premium"], format_func=lambda value: {"low": "Low", "medium": "Medium", "premium": "Premium"}[value], help="Overall location tier assigned in the dataset.")
+        income_level = st.selectbox("Area income level", options=["low", "mid", "high"], format_func=lambda value: {"low": "Low", "mid": "Middle", "high": "High"}[value], help="Income-level category of the surrounding area in the dataset.")
+
+    submitted = st.form_submit_button("Estimate property price", type="primary", width = 'stretch')
+
+if submitted:
+    values = [
+        area, bedrooms, bathrooms, floors, age, distance, garage, parking, garden,
+        security, school_nearby, hospital_nearby, shopping_mall_nearby,
+        public_transport, crime_rate, population_density, location, income_level,
+    ]
+    house = pd.DataFrame([values], columns=FEATURES)
+    prediction = float(model.predict(house)[0])
+    contributions, baseline = explain_prediction(model, house)
+
+    st.divider()
+    st.subheader("Estimated value")
+    st.metric("Estimated sale price", f"${prediction:,.0f}")
+    st.caption(f"SHAP baseline: ${baseline:,.0f}. Contributions show how each feature moves this prediction from the baseline.")
+
+    positive = contributions[contributions > 0].sort_values(ascending=False).head(5)
+    negative = contributions[contributions < 0].sort_values().head(5)
+    up, down = st.columns(2)
+    with up:
+        st.markdown("#### Top 5 factors increasing the estimate")
+        if positive.empty:
+            st.info("No positive SHAP contributions for this property.")
+        for feature, impact in positive.items():
+            st.metric(LABELS.get(feature, feature), str(house[feature].iloc[0]), delta=f"+${impact:,.0f}")
+    with down:
+        st.markdown("#### Top 5 factors decreasing the estimate")
+        if negative.empty:
+            st.info("No negative SHAP contributions for this property.")
+        for feature, impact in negative.items():
+            st.metric(LABELS.get(feature, feature), str(house[feature].iloc[0]), delta=f"${impact:,.0f}", delta_color="inverse")
+
+    st.markdown("#### Full SHAP contribution ranking")
+    st.bar_chart(contributions.rename("Impact on price ($)"), horizontal=True, color="#3867D6")
+
+with st.expander("How to interpret the metrics"):
     st.markdown("""
-    - Categorical fields are one-hot encoded; missing values are imputed inside the training pipeline.
-    - The model is a Random Forest Regressor trained on a random training split.
-    - MAE and RMSE summarize errors on the held-out records; they do not measure uncertainty for an individual home.
-    - SHAP attributes the model output across input features. It does not prove that a feature causes a price change.
-    - The stability experiment changes one numeric input at a time while holding all other values fixed.
-    - The Kaggle dataset reflects a specific market and period; predictions should not be used as professional valuations.
+    - **MAE** is the average price error in dollars.
+    - **RMSE** penalises occasional large errors more strongly.
+    - **R²** shows the share of price variation explained by the model; values closer to 1 are better.
+    - SHAP explains model behaviour. It does not prove that a feature causes a price change.
     """)
