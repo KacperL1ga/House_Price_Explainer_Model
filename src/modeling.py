@@ -1,45 +1,53 @@
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
+
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
+from xgboost import XGBRegressor
 
-from src.data import Dataset
+from src.data import FEATURES, TARGET
 
 
-def fit_model(dataset: Dataset, seed: int = 42):
-    x_train, x_test, y_train, y_test = train_test_split(
-        dataset.X, dataset.y, test_size=0.2, random_state=seed
-    )
-    numeric = x_train.select_dtypes(include=["number", "bool"]).columns.tolist()
-    categorical = [c for c in x_train.columns if c not in numeric]
-    transformers = []
-    if numeric:
-        transformers.append(("num", SimpleImputer(strategy="median"), numeric))
-    if categorical:
-        cat_pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-        ])
-        transformers.append(("cat", cat_pipeline, categorical))
-    preprocessor = ColumnTransformer(transformers, verbose_feature_names_out=True)
-    model = Pipeline([
-        ("preprocessor", preprocessor),
-        ("regressor", RandomForestRegressor(n_estimators=250, min_samples_leaf=2, n_jobs=-1, random_state=seed)),
+def make_preprocessor() -> ColumnTransformer:
+    numeric = FEATURES[:-2]
+    categorical = FEATURES[-2:]
+    return ColumnTransformer([
+        ("numbers", SimpleImputer(strategy="median"), numeric),
+        ("categories", Pipeline([
+            ("fill_missing", SimpleImputer(strategy="most_frequent")),
+            ("one_hot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), categorical),
     ])
-    model.fit(x_train, y_train)
-    return model, x_train, x_test, y_train, y_test, preprocessor
 
 
-def evaluate_model(model, x_test: pd.DataFrame, y_test: pd.Series) -> dict[str, float]:
-    predictions = model.predict(x_test)
-    return {
-        "mae": float(mean_absolute_error(y_test, predictions)),
-        "rmse": float(np.sqrt(mean_squared_error(y_test, predictions))),
+def train_model(data: pd.DataFrame, seed: int = 42):
+    X = data[FEATURES]
+    y = data[TARGET]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed)
+    model = Pipeline([
+        ("preprocessor", make_preprocessor()),
+        ("regressor", XGBRegressor(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=8,
+            subsample=0.85,
+            colsample_bytree=0.9,
+            objective="reg:squarederror",
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=seed,
+            verbosity=0,
+        )),
+    ])
+    model.fit(X_train, y_train)
+    prediction = model.predict(X_test)
+    metrics = {
+        "mae": mean_absolute_error(y_test, prediction),
+        "rmse": np.sqrt(mean_squared_error(y_test, prediction)),
+        "r2": r2_score(y_test, prediction),
     }
+    return model, X_test, y_test, metrics
